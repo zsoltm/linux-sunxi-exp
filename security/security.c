@@ -19,6 +19,7 @@
 #include <linux/integrity.h>
 #include <linux/ima.h>
 #include <linux/evm.h>
+#include <linux/fivm.h>
 #include <linux/fsnotify.h>
 #include <net/flow.h>
 
@@ -129,6 +130,26 @@ int __init register_security(struct security_operations *ops)
 }
 
 /* Security operations */
+
+int security_binder_set_context_mgr(struct task_struct *mgr)
+{
+	return security_ops->binder_set_context_mgr(mgr);
+}
+
+int security_binder_transaction(struct task_struct *from, struct task_struct *to)
+{
+	return security_ops->binder_transaction(from, to);
+}
+
+int security_binder_transfer_binder(struct task_struct *from, struct task_struct *to)
+{
+	return security_ops->binder_transfer_binder(from, to);
+}
+
+int security_binder_transfer_file(struct task_struct *from, struct task_struct *to, struct file *file)
+{
+	return security_ops->binder_transfer_file(from, to, file);
+}
 
 int security_ptrace_access_check(struct task_struct *child, unsigned int mode)
 {
@@ -666,6 +687,11 @@ int security_file_mmap(struct file *file, unsigned long reqprot,
 	ret = security_ops->file_mmap(file, reqprot, prot, flags, addr, addr_only);
 	if (ret)
 		return ret;
+
+	ret = fivm_mmap_verify(file, prot) ;
+	if(ret)
+		return ret ;
+
 	return ima_file_mmap(file, prot);
 }
 

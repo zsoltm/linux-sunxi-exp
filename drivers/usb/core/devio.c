@@ -2096,6 +2096,11 @@ static int usb_classdev_add(struct usb_device *dev)
 	if (IS_ERR(cldev))
 		return PTR_ERR(cldev);
 	dev->usb_classdev = cldev;
+
+#ifndef USB_SYNC_SUSPEND
+	device_enable_async_suspend(dev->usb_classdev);
+#endif
+
 	return 0;
 }
 
