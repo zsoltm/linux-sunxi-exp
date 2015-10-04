@@ -203,6 +203,41 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
 						mem, &clen);
 	zs_unmap_object(zram->mem_pool, handle);
 
+	/* Page is stored uncompressed since it's incompressible */
+	if (unlikely(zram_test_flag(zram, index, ZRAM_UNCOMPRESSED))) {
+		handle_uncompressed_page(zram, bvec, index, offset);
+		return 0;
+	}
+
+	if (is_partial_io(bvec)) {
+		/* Use  a temporary buffer to decompress the page */
+		uncmem = kmalloc(PAGE_SIZE, GFP_NOIO);
+		if (!uncmem) {
+			pr_info("Error allocating temp memory!\n");
+			return -ENOMEM;
+		}
+	}
+
+	user_mem = kmap_atomic(page);
+	if (!is_partial_io(bvec))
+		uncmem = user_mem;
+	clen = PAGE_SIZE;
+
+	cmem = zs_map_object(zram->mem_pool, zram->table[index].handle);
+
+	ret = lzo1x_decompress_safe(cmem + sizeof(*zheader),
+				    zram->table[index].size,
+				    uncmem, &clen);
+
+	if (is_partial_io(bvec)) {
+		memcpy(user_mem + bvec->bv_offset, uncmem + offset,
+		       bvec->bv_len);
+		kfree(uncmem);
+	}
+
+	zs_unmap_object(zram->mem_pool, zram->table[index].handle);
+	kunmap_atomic(user_mem);
+
 	/* Should NEVER happen. Return bio error if it does. */
 	if (unlikely(ret != LZO_E_OK)) {
 		pr_err("Decompression failed! err=%d, page=%u\n", ret, index);
@@ -461,13 +496,20 @@ out:
  */
 static inline int valid_io_request(struct zram *zram, struct bio *bio)
 {
-	if (unlikely(
-		(bio->bi_sector >= (zram->disksize >> SECTOR_SHIFT)) ||
-		(bio->bi_sector & (ZRAM_SECTOR_PER_LOGICAL_BLOCK - 1)) ||
-		(bio->bi_size & (ZRAM_LOGICAL_BLOCK_SIZE - 1)))) {
+	u64 start, end, bound;
 
+	/* unaligned request */
+	if (unlikely(bio->bi_sector & (ZRAM_SECTOR_PER_LOGICAL_BLOCK - 1)))
 		return 0;
-	}
+	if (unlikely(bio->bi_size & (ZRAM_LOGICAL_BLOCK_SIZE - 1)))
+		return 0;
+
+	start = bio->bi_sector;
+	end = start + (bio->bi_size >> SECTOR_SHIFT);
+	bound = zram->disksize >> SECTOR_SHIFT;
+	/* out of range range */
+	if (unlikely(start >= bound || end > bound || start > end))
+		return 0;
 
 	/* I/O request is valid */
 	return 1;
@@ -629,7 +671,7 @@ static const struct block_device_operations zram_devops = {
 
 static int create_device(struct zram *zram, int device_id)
 {
-	int ret = 0;
+	int ret = -ENOMEM;
 
 	init_rwsem(&zram->lock);
 	init_rwsem(&zram->init_lock);
@@ -639,7 +681,6 @@ static int create_device(struct zram *zram, int device_id)
 	if (!zram->queue) {
 		pr_err("Error allocating disk queue for device %d\n",
 			device_id);
-		ret = -ENOMEM;
 		goto out;
 	}
 
@@ -650,10 +691,9 @@ static int create_device(struct zram *zram, int device_id)
 	zram->disk = alloc_disk(1);
 	if (!zram->disk) {
 		blk_cleanup_queue(zram->queue);
-		pr_warn("Error allocating disk structure for device %d\n",
+		pr_warning("Error allocating disk structure for device %d\n",
 			device_id);
-		ret = -ENOMEM;
-		goto out;
+		goto out_free_queue;
 	}
 
 	zram->disk->major = zram_major;
@@ -681,12 +721,18 @@ static int create_device(struct zram *zram, int device_id)
 	ret = sysfs_create_group(&disk_to_dev(zram->disk)->kobj,
 				&zram_disk_attr_group);
 	if (ret < 0) {
-		pr_warn("Error creating sysfs group");
-		goto out;
+		pr_warning("Error creating sysfs group");
+		goto out_free_disk;
 	}
 
 	zram->init_done = 0;
+	return 0;
 
+out_free_disk:
+	del_gendisk(zram->disk);
+	put_disk(zram->disk);
+out_free_queue:
+	blk_cleanup_queue(zram->queue);
 out:
 	return ret;
 }
@@ -715,7 +761,7 @@ static int __init zram_init(void)
 	int ret, dev_id;
 
 	if (num_devices > max_num_devices) {
-		pr_warn("Invalid value for num_devices: %u\n",
+		pr_warning("Invalid value for num_devices: %u\n",
 				num_devices);
 		ret = -EINVAL;
 		goto out;
@@ -723,7 +769,7 @@ static int __init zram_init(void)
 
 	zram_major = register_blkdev(0, "zram");
 	if (zram_major <= 0) {
-		pr_warn("Unable to get major number\n");
+		pr_warning("Unable to get major number\n");
 		ret = -EBUSY;
 		goto out;
 	}
@@ -767,9 +813,11 @@ static void __exit zram_exit(void)
 	for (i = 0; i < num_devices; i++) {
 		zram = &zram_devices[i];
 
+		get_disk(zram->disk);
 		destroy_device(zram);
 		if (zram->init_done)
 			zram_reset_device(zram);
+		put_disk(zram->disk);
 	}
 
 	unregister_blkdev(zram_major, "zram");
