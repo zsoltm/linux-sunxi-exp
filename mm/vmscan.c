@@ -2923,7 +2923,8 @@ loop_again:
 				continue;
 			}
 
-			if (zone_balanced(zone, testorder, 0, end_zone)) {
+			if (!zone_balanced(zone, testorder, 0, end_zone)) {
+				all_zones_ok = 0;
 				/*
 				 * If a zone reaches its high watermark,
 				 * consider it to be no longer congested. It's
